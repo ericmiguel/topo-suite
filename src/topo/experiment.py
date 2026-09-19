@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import xarray as xr
 
-from topo.cache import experiment_cache_dir
-from topo.cache import experiment_cache_key
-from topo.cache import experiment_store_path
+from topo.cache import default_namespace
+from topo.cache import legend_payload
+from topo.cache import normalize_dataclass
+from topo.cache import request_fingerprint
+from topo.cache import summarize_coverage
 from topo.catalog import ITEMS_URL
 from topo.catalog import StacTile
 from topo.catalog import next_url
@@ -32,6 +36,7 @@ from topo.zarr import write_tiles
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from topo.retrieval import Fetcher
@@ -67,27 +72,33 @@ class Experiment:
         self.name = name
         self.requests = dict(requests)
         self.root_dir = resolve_project_root(root_dir)
+        self._namespace = default_namespace(self.root_dir, name)
+        self._fingerprint = request_fingerprint(self.requests)
         self.fetcher = downloader or HttpxFetcher()
         self.reader = reader or RasterioTileReader()
-        self._cache_key = experiment_cache_key(name, self.requests)
         self._tiles: dict[str, tuple[StacTile, ...]] = {}
         self._store_path: Path | None = None
         self._logger = logging.getLogger(__name__)
 
     @property
     def cache_key(self) -> str:
-        """Return the isolated experiment key."""
-        return self._cache_key
+        """Return the request fingerprint (legacy name kept for callers)."""
+        return self._fingerprint
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the request fingerprint that identifies the store."""
+        return self._fingerprint
 
     @property
     def cache_path(self) -> Path:
-        """Return the manifest cache directory."""
-        return experiment_cache_dir(self.root_dir / ".cache", self._cache_key)
+        """Return the source-global fragment pool directory."""
+        return self._namespace.pool_dir
 
     @property
     def store_path(self) -> Path:
-        """Return the canonical Zarr path."""
-        return experiment_store_path(self.root_dir / "data", self._cache_key)
+        """Return the store path for this request fingerprint."""
+        return self._namespace.store_path(self._fingerprint)
 
     @property
     def layout(self) -> Layout:
@@ -158,6 +169,13 @@ class Experiment:
         self._store_path = destination
         if listener is not None:
             listener(ItemWritten(description=str(destination), path=destination))
+        self._namespace.record_store(
+            self._fingerprint,
+            requests=_requests_identity(self.requests),
+            coverage=summarize_coverage(self.requests),
+            provenance=legend_payload(),
+            now=_utc_now(),
+        )
         self._logger.info("Wrote TOPODATA Zarr store %s.", destination)
         return destination
 
@@ -212,3 +230,19 @@ def _manifest(tiles_by_request: dict[str, tuple[StacTile, ...]]) -> dict[str, ob
         ]
         for request, tiles in tiles_by_request.items()
     }
+
+
+def _requests_identity(requests: Mapping[str, object]) -> dict[str, object]:
+    """Return a JSON-safe description of the named requests."""
+    return {
+        name: {
+            "type": type(request).__qualname__,
+            "fields": normalize_dataclass(request),
+        }
+        for name, request in sorted(requests.items())
+    }
+
+
+def _utc_now() -> str:
+    """Return the current UTC time as an ISO-8601 string."""
+    return datetime.now(UTC).isoformat()
